@@ -1,7 +1,9 @@
-// MIN FAILING SAMPLE. 
-// - Manually create a HTML page in a string that'll do the alert() thing. 
-// - Possibly include timer one to show how working looks.
-// - see if I can get it working with just a manual yield in the stream macro, not even using the watcher.
+// MINIMUM FAILING SAMPLE : run with `cargo run -- <path to some file>`
+// GOAL: to send an SSE event with warp whenever a file changes
+// CURRENT: I've got this set up to do three things:
+// 1. WORKING: Send, receive, and display an SSE event every 3 seconds
+// 2. WORKING: Asynchronously watch a directory for changes, outputting to the console when a change is detected
+// 3. FAILING: Send an SSE event when a change is detected
 
 use std::convert::Infallible;
 use std::path::Path;
@@ -14,14 +16,12 @@ use warp::{sse, Filter};
 
 use notify::{ Event, RecommendedWatcher, RecursiveMode, Watcher, Config };
 
-// index.html string
+// basic test web page, adds a line to the body each time an SSE event is received
 const INDEX_HTML: &str = r#"
 <!DOCTYPE HTML>
 <html>
-<head> <meta charset="UTF-8"> </head>
-
 <body>
-  <h1>Warp SSE Push on File Change</h1>
+  <h1>Warp SSE on File Change Demo</h1>
   <script> 
       var tickSource = new EventSource("/tick");
       var fileChangeSource = new EventSource("/file_change");
@@ -40,12 +40,9 @@ const INDEX_HTML: &str = r#"
 
 
 // simple SSE event
-fn sse_event() -> Result<sse::Event, Infallible> {
-    Ok(sse::Event::default().data(""))
-}
+fn sse_event() -> Result<sse::Event, Infallible> { Ok(sse::Event::default().data("")) }
 
-// async notify stuff
-
+// from the example in the notify crate for working with tokio
 // https://github.com/notify-rs/notify/blob/e375fcefd23edd23e7138d8b3a97a721d6b7bbca/examples/async_monitor.rs#L22
 fn async_watcher() -> notify::Result<(RecommendedWatcher, Receiver<notify::Result<Event>>)> {
     let (mut tx, rx) = channel(1);
@@ -59,9 +56,28 @@ fn async_watcher() -> notify::Result<(RecommendedWatcher, Receiver<notify::Resul
     Ok((watcher, rx))
 }
 
-// -- main ---------------------------------------------------------------------
 
-async fn sse_file_watch() {
+
+// locally watch a file for changes
+async fn local() {
+    let (mut watcher, mut rx) = async_watcher().unwrap();
+
+    watcher.watch(
+            Path::new(&*std::env::args().nth(1).unwrap()), 
+            RecursiveMode::Recursive
+        ).unwrap();
+
+    loop {
+        if let Some(_) = rx.next().await {
+            println!("local context: file changed");
+        }
+    }
+}
+
+
+
+// host a webpage with 2 SSE endpoints
+async fn webpage() {
     let index = warp::path::end().map(|| warp::reply::html(INDEX_HTML));
 
     // send an sse event on /tick every 3 seconds
@@ -70,7 +86,7 @@ async fn sse_file_watch() {
         let stream = stream! {
             loop {
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                println!("tick");
+                println!("sending tick event");
                 yield sse_event();
             }
         };
@@ -80,6 +96,9 @@ async fn sse_file_watch() {
     });
 
     // sse event on /file_change every time the file changes
+    // BROKEN: this is the bit that doesn't seem to work, despite nearly 
+    // identical code working in the local() function to watch the file, and the
+    // stream! macro working in the tick_sse function.
     let file_change_sse = warp::path("file_change").and(warp::get()).map(|| {
 
         let (mut watcher, mut rx) = async_watcher().unwrap();
@@ -90,11 +109,8 @@ async fn sse_file_watch() {
             ).unwrap();
 
         let stream = stream! {
-            while let Some(res) = rx.next().await {
-                match res {
-                    Ok(event) => { println!("event: {:?}", event); }
-                    Err(e) => { println!("watch error: {:?}", e); }
-                }
+            while let Some(_) = rx.next().await {
+                println!("sending file change event");
                 yield sse_event();
             }
         };
@@ -110,25 +126,6 @@ async fn sse_file_watch() {
     warp::serve(index.or(tick_sse).or(file_change_sse)).run(([127, 0, 0, 1], 3000)).await;
 }
 
-async fn local_file_watch() {
-    let (mut watcher, mut rx) = async_watcher().unwrap();
-
-    watcher.watch(
-            Path::new(&*std::env::args().nth(1).unwrap()), 
-            RecursiveMode::Recursive
-        ).unwrap();
-
-    loop {
-        if let Some(res) = rx.next().await {
-            match res {
-                Ok(event) => { println!("event: {:?}", event); }
-                Err(e) => { println!("watch error: {:?}", e); }
-            }
-        }
-    }
-}
-
-
 
 #[tokio::main]
-async fn main() { tokio::join!(sse_file_watch(), local_file_watch()); }
+async fn main() { tokio::join!(webpage(), local()); }
